@@ -95,7 +95,7 @@ func (s *SpannerService) ListSessions(ctx context.Context, req *pb.ListSessionsR
 	if err != nil {
 		return nil, err
 	}
-	query := fmt.Sprintf("SELECT session FROM %s", s.config.SessionsTable)
+	query := fmt.Sprintf("SELECT Session FROM %s", s.config.SessionsTable)
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -246,7 +246,7 @@ func (s *SpannerService) ListEvents(ctx context.Context, req *pb.ListEventsReque
 	}
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf(
-			"SELECT session_event FROM %s WHERE %s ORDER BY %s LIMIT @limit OFFSET @offset",
+			"SELECT SessionEvent FROM %s WHERE %s ORDER BY %s LIMIT @limit OFFSET @offset",
 			s.config.EventsTable,
 			where,
 			applyEventOrderBy(req.GetOrderBy()),

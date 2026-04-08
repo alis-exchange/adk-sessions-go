@@ -79,7 +79,7 @@ func (s *ADKService) Get(ctx context.Context, req *adksession.GetRequest) (*adks
 
 func (s *ADKService) List(ctx context.Context, req *adksession.ListRequest) (*adksession.ListResponse, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session FROM %s WHERE app_name=@app_name", s.store.config.SessionsTable),
+		SQL:    fmt.Sprintf("SELECT Session FROM %s WHERE app_name=@app_name", s.store.config.SessionsTable),
 		Params: map[string]any{"app_name": req.AppName},
 	}
 	if req.UserID != "" {
@@ -129,6 +129,9 @@ func (s *ADKService) AppendEvent(ctx context.Context, sess adksession.Session, e
 		dbSession.session.UpdateTime = pbEvent.Timestamp
 		if delta := pbEvent.GetActions().GetStateDelta(); delta != nil {
 			current := structMap(dbSession.session.GetState())
+			if current == nil {
+				current = map[string]any{}
+			}
 			maps.Copy(current, delta.AsMap())
 			state, err := structpb.NewStruct(current)
 			if err == nil {
@@ -152,7 +155,7 @@ func (s *ADKService) listEventsForADK(ctx context.Context, req *adksession.GetRe
 		limit = " LIMIT @limit"
 	}
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session_event FROM %s WHERE %s ORDER BY timestamp ASC%s", s.store.config.EventsTable, where, limit),
+		SQL:    fmt.Sprintf("SELECT SessionEvent FROM %s WHERE %s ORDER BY timestamp ASC%s", s.store.config.EventsTable, where, limit),
 		Params: params,
 	}
 	iter := s.store.db.Single().Query(ctx, stmt)
