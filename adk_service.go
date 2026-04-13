@@ -79,7 +79,7 @@ func (s *ADKService) Get(ctx context.Context, req *adksession.GetRequest) (*adks
 
 func (s *ADKService) List(ctx context.Context, req *adksession.ListRequest) (*adksession.ListResponse, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT Session FROM %s WHERE app_name=@app_name", s.store.config.SessionsTable),
+		SQL:    fmt.Sprintf("SELECT Session FROM %s WHERE app_name=@app_name", s.store.sessionsTable()),
 		Params: map[string]any{"app_name": req.AppName},
 	}
 	if req.UserID != "" {
@@ -155,7 +155,7 @@ func (s *ADKService) listEventsForADK(ctx context.Context, req *adksession.GetRe
 		limit = " LIMIT @limit"
 	}
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT SessionEvent FROM %s WHERE %s ORDER BY timestamp ASC%s", s.store.config.EventsTable, where, limit),
+		SQL:    fmt.Sprintf("SELECT SessionEvent FROM %s WHERE %s ORDER BY timestamp ASC%s", s.store.eventsTable(), where, limit),
 		Params: params,
 	}
 	iter := s.store.db.Single().Query(ctx, stmt)

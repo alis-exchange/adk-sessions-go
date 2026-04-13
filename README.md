@@ -82,16 +82,16 @@ go get -u go.alis.build/adk/sessions
 Treat the package as three deliberate steps:
 
 1. **Provision the backing Spanner schema** your runtime will depend on.
-2. **Instantiate `SpannerService`** with table names that exactly match that schema.
+2. **Instantiate `SpannerService`** with the database connection details and, optionally, a shared table prefix.
 3. **Reuse the same store** for both ADK session handling and the generated gRPC API.
 
-The important constraint is that the runtime configuration is not separate from the infrastructure contract. If your Terraform names and your `SpannerConfig` values drift apart, the package will not find the session, event, or state tables it expects.
+The package uses fixed logical table names: `Sessions`, `SessionEvents`, `AppStates`, and `UserStates`. If you set `TablePrefix`, those resolve to `<prefix>_Sessions`, `<prefix>_SessionEvents`, `<prefix>_AppStates`, and `<prefix>_UserStates`.
 
 ## Getting started
 
 ### Step 1: Provision the backing tables first
 
-The package expects four Spanner tables:
+The package expects four logical Spanner tables:
 
 - `Sessions`
 - `SessionEvents`
@@ -123,7 +123,7 @@ module "alis_adk_sessions_v1" {
 }
 ```
 
-Inside `infra/modules/alis.adk.sessions.v1/main.tf`, define the tables expected by the package. A minimal module looks like this:
+Inside `infra/modules/alis.adk.sessions.v1/main.tf`, define the tables expected by the package. A practical pattern is to derive one shared prefix from the project and service name, then apply it to each logical table. A minimal module looks like this:
 
 ```hcl
 resource "alis_google_spanner_table" "sessions" {
@@ -332,12 +332,12 @@ At the end of this step, you should know these concrete values:
 | Value | Why it matters |
 | --- | --- |
 | `Project`, `Instance`, `Database` | Tells the package which Spanner database to connect to. |
-| `SessionsTable`, `EventsTable`, `AppStatesTable`, `UserStatesTable` | Must match the actual table names you provisioned. |
+| `TablePrefix` | Optional namespace added ahead of each logical table name. |
 | `DatabaseRole` | Optional Spanner database role used by the client. |
 
 ### Step 2: Create the store with matching values
 
-Once the tables exist, construct the backing store with the exact same names:
+Once the tables exist, construct the backing store with the same prefix convention:
 
 ```go
 package main
@@ -351,14 +351,11 @@ import (
 
 func initSessionStore(ctx context.Context) *sessions.SpannerService {
 	store, err := sessions.NewSpannerService(ctx, sessions.SpannerConfig{
-		Project:         "SPANNER_PROJECT_ID",
-		Instance:        "SPANNER_INSTANCE_ID",
-		Database:        "SPANNER_DATABASE_ID",
-		DatabaseRole:    "OPTIONAL_DATABASE_ROLE",
-		SessionsTable:   "my_agent_v2_Sessions",
-		EventsTable:     "my_agent_v2_SessionEvents",
-		AppStatesTable:  "my_agent_v2_AppStates",
-		UserStatesTable: "my_agent_v2_UserStates",
+		Project:      "SPANNER_PROJECT_ID",
+		Instance:     "SPANNER_INSTANCE_ID",
+		Database:     "SPANNER_DATABASE_ID",
+		DatabaseRole: "OPTIONAL_DATABASE_ROLE",
+		TablePrefix:  "my_agent_v2",
 	})
 	if err != nil {
 		log.Fatalf("init session store: %v", err)
@@ -367,7 +364,7 @@ func initSessionStore(ctx context.Context) *sessions.SpannerService {
 }
 ```
 
-If you keep the default table names (`Sessions`, `SessionEvents`, `AppStates`, `UserStates`), you can omit the table fields from `SpannerConfig`.
+If you keep the default table names (`Sessions`, `SessionEvents`, `AppStates`, `UserStates`), you can omit `TablePrefix`.
 
 ### Step 3: Reuse the same store everywhere
 
@@ -403,13 +400,10 @@ import (
 
 func initSessionService(ctx context.Context) adksession.Service {
 	store, err := sessions.NewSpannerService(ctx, sessions.SpannerConfig{
-		Project:         "my-spanner-project",
-		Instance:        "my-spanner-instance",
-		Database:        "my-spanner-database",
-		SessionsTable:   "Sessions",
-		EventsTable:     "SessionEvents",
-		AppStatesTable:  "AppStates",
-		UserStatesTable: "UserStates",
+		Project:     "my-spanner-project",
+		Instance:    "my-spanner-instance",
+		Database:    "my-spanner-database",
+		TablePrefix: "my_agent_v2",
 	})
 	if err != nil {
 		log.Fatalf("init session store: %v", err)

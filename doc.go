@@ -10,6 +10,12 @@
 //
 // Expected Spanner schema:
 //
+// The package uses fixed logical table names:
+// Sessions, SessionEvents, AppStates, and UserStates.
+// When SpannerConfig.TablePrefix is set, the runtime resolves them as
+// <prefix>_Sessions, <prefix>_SessionEvents, <prefix>_AppStates, and
+// <prefix>_UserStates.
+//
 // Sessions table:
 //
 //	session_id STRING(MAX) NOT NULL,

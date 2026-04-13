@@ -19,15 +19,29 @@ import (
 	pb "go.alis.build/common/alis/adk/sessions/v1"
 )
 
+const (
+	sessionsTableName   = "Sessions"
+	eventsTableName     = "SessionEvents"
+	appStatesTableName  = "AppStates"
+	userStatesTableName = "UserStates"
+)
+
+// SpannerConfig configures the Spanner-backed session store.
+//
+// The package always uses the logical table names Sessions, SessionEvents,
+// AppStates, and UserStates. When TablePrefix is set, each table name is
+// resolved as <prefix>_<logical-name>.
 type SpannerConfig struct {
-	Project         string
-	Instance        string
-	Database        string
-	DatabaseRole    string
-	SessionsTable   string
-	EventsTable     string
-	AppStatesTable  string
-	UserStatesTable string
+	// Project is the Google Cloud project that owns the Spanner database.
+	Project string
+	// Instance is the Spanner instance ID.
+	Instance string
+	// Database is the Spanner database ID.
+	Database string
+	// DatabaseRole is an optional Spanner database role for the client.
+	DatabaseRole string
+	// TablePrefix is an optional prefix applied to each logical table name.
+	TablePrefix string
 }
 
 type SpannerService struct {
@@ -37,18 +51,6 @@ type SpannerService struct {
 }
 
 func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerService, error) {
-	if config.SessionsTable == "" {
-		config.SessionsTable = "Sessions"
-	}
-	if config.EventsTable == "" {
-		config.EventsTable = "SessionEvents"
-	}
-	if config.AppStatesTable == "" {
-		config.AppStatesTable = "AppStates"
-	}
-	if config.UserStatesTable == "" {
-		config.UserStatesTable = "UserStates"
-	}
 	dbName := fmt.Sprintf("projects/%s/instances/%s/databases/%s", config.Project, config.Instance, config.Database)
 	db, err := spanner.NewClientWithConfig(ctx, dbName, spanner.ClientConfig{
 		DisableNativeMetrics: true,
@@ -58,6 +60,22 @@ func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerServi
 		return nil, err
 	}
 	return &SpannerService{db: db, config: config}, nil
+}
+
+func (s *SpannerService) sessionsTable() string {
+	return prefixedTableName(s.config.TablePrefix, sessionsTableName)
+}
+
+func (s *SpannerService) eventsTable() string {
+	return prefixedTableName(s.config.TablePrefix, eventsTableName)
+}
+
+func (s *SpannerService) appStatesTable() string {
+	return prefixedTableName(s.config.TablePrefix, appStatesTableName)
+}
+
+func (s *SpannerService) userStatesTable() string {
+	return prefixedTableName(s.config.TablePrefix, userStatesTableName)
 }
 
 func (s *SpannerService) Register(registrar grpc.ServiceRegistrar) {
@@ -95,7 +113,7 @@ func (s *SpannerService) ListSessions(ctx context.Context, req *pb.ListSessionsR
 	if err != nil {
 		return nil, err
 	}
-	query := fmt.Sprintf("SELECT Session FROM %s", s.config.SessionsTable)
+	query := fmt.Sprintf("SELECT Session FROM %s", s.sessionsTable())
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -193,14 +211,14 @@ func (s *SpannerService) DeleteSession(ctx context.Context, req *pb.DeleteSessio
 		return nil, err
 	}
 	muts := []*spanner.Mutation{
-		spanner.Delete(s.config.SessionsTable, spanner.Key{record.SessionID, record.AppName, record.UserID}),
+		spanner.Delete(s.sessionsTable(), spanner.Key{record.SessionID, record.AppName, record.UserID}),
 	}
 	eventKeys, err := s.listEventKeys(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	for _, key := range eventKeys {
-		muts = append(muts, spanner.Delete(s.config.EventsTable, key))
+		muts = append(muts, spanner.Delete(s.eventsTable(), key))
 	}
 	_, err = s.db.Apply(ctx, muts)
 	if err != nil {
@@ -247,7 +265,7 @@ func (s *SpannerService) ListEvents(ctx context.Context, req *pb.ListEventsReque
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf(
 			"SELECT SessionEvent FROM %s WHERE %s ORDER BY %s LIMIT @limit OFFSET @offset",
-			s.config.EventsTable,
+			s.eventsTable(),
 			where,
 			applyEventOrderBy(req.GetOrderBy()),
 		),
@@ -357,7 +375,7 @@ func (s *SpannerService) appendEvent(ctx context.Context, sessionID string, inpu
 		}
 		event.Actions.StateDelta = stateDelta
 	}
-	eventMutation := spanner.Insert(s.config.EventsTable,
+	eventMutation := spanner.Insert(s.eventsTable(),
 		[]string{"session_id", "app_name", "user_id", "event_id", "SessionEvent"},
 		[]any{event.GetSessionId(), event.GetAppName(), event.GetUserId(), event.GetId(), event},
 	)
@@ -394,7 +412,7 @@ func (s *SpannerService) appendEvent(ctx context.Context, sessionID string, inpu
 }
 
 func (s *SpannerService) sessionMutation(session *pb.Session) (*spanner.Mutation, error) {
-	return spanner.InsertOrUpdate(s.config.SessionsTable,
+	return spanner.InsertOrUpdate(s.sessionsTable(),
 		[]string{"session_id", "app_name", "user_id", "Session"},
 		[]any{session.GetId(), session.GetAppName(), session.GetUserId(), session},
 	), nil
@@ -436,7 +454,7 @@ func (s *SpannerService) appStateMutation(ctx context.Context, appName string, d
 		return nil, err
 	}
 	resource := &pb.AppState{AppName: appName, State: state, UpdateTime: timestamppb.Now()}
-	return spanner.InsertOrUpdate(s.config.AppStatesTable,
+	return spanner.InsertOrUpdate(s.appStatesTable(),
 		[]string{"app_name", "AppState"},
 		[]any{appName, resource},
 	), nil
@@ -455,14 +473,14 @@ func (s *SpannerService) userStateMutation(ctx context.Context, appName, userID 
 		return nil, err
 	}
 	resource := &pb.UserState{AppName: appName, UserId: userID, State: state, UpdateTime: timestamppb.Now()}
-	return spanner.InsertOrUpdate(s.config.UserStatesTable,
+	return spanner.InsertOrUpdate(s.userStatesTable(),
 		[]string{"app_name", "user_id", "UserState"},
 		[]any{appName, userID, resource},
 	), nil
 }
 
 func (s *SpannerService) readSessionByCompositeKey(ctx context.Context, sessionID, appName, userID string) (*sessionRecord, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.config.SessionsTable, spanner.Key{sessionID, appName, userID},
+	row, err := s.db.Single().ReadRow(ctx, s.sessionsTable(), spanner.Key{sessionID, appName, userID},
 		[]string{"session_id", "app_name", "user_id", "create_time", "update_time", "Session"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
@@ -480,7 +498,7 @@ func (s *SpannerService) readSessionByCompositeKey(ctx context.Context, sessionI
 
 func (s *SpannerService) readSessionByID(ctx context.Context, sessionID string) (*sessionRecord, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, create_time, update_time, Session FROM %s WHERE session_id=@session_id LIMIT 2", s.config.SessionsTable),
+		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, create_time, update_time, Session FROM %s WHERE session_id=@session_id LIMIT 2", s.sessionsTable()),
 		Params: map[string]any{"session_id": sessionID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -512,7 +530,7 @@ func (s *SpannerService) readSessionByID(ctx context.Context, sessionID string) 
 
 func (s *SpannerService) readEventByID(ctx context.Context, sessionID, eventID string) (*eventRecord, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id, timestamp, SessionEvent FROM %s WHERE session_id=@session_id AND event_id=@event_id LIMIT 2", s.config.EventsTable),
+		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id, timestamp, SessionEvent FROM %s WHERE session_id=@session_id AND event_id=@event_id LIMIT 2", s.eventsTable()),
 		Params: map[string]any{"session_id": sessionID, "event_id": eventID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -544,7 +562,7 @@ func (s *SpannerService) readEventByID(ctx context.Context, sessionID, eventID s
 
 func (s *SpannerService) listEventKeys(ctx context.Context, sessionID string) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id FROM %s WHERE session_id=@session_id", s.config.EventsTable),
+		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id FROM %s WHERE session_id=@session_id", s.eventsTable()),
 		Params: map[string]any{"session_id": sessionID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -568,7 +586,7 @@ func (s *SpannerService) listEventKeys(ctx context.Context, sessionID string) ([
 }
 
 func (s *SpannerService) readAppState(ctx context.Context, appName string) (map[string]any, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.config.AppStatesTable, spanner.Key{appName}, []string{"AppState"})
+	row, err := s.db.Single().ReadRow(ctx, s.appStatesTable(), spanner.Key{appName}, []string{"AppState"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return nil, err
@@ -583,7 +601,7 @@ func (s *SpannerService) readAppState(ctx context.Context, appName string) (map[
 }
 
 func (s *SpannerService) readUserState(ctx context.Context, appName, userID string) (map[string]any, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.config.UserStatesTable, spanner.Key{appName, userID}, []string{"UserState"})
+	row, err := s.db.Single().ReadRow(ctx, s.userStatesTable(), spanner.Key{appName, userID}, []string{"UserState"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return nil, err

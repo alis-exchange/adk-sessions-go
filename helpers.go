@@ -28,6 +28,13 @@ var (
 	eventFilterRE      = regexp.MustCompile(`^\s*timestamp\s*(<=|>=|=|<|>)\s*"([^"]+)"\s*$`)
 )
 
+func prefixedTableName(prefix, name string) string {
+	if strings.TrimSpace(prefix) == "" {
+		return name
+	}
+	return fmt.Sprintf("%s_%s", prefix, name)
+}
+
 type sessionRecord struct {
 	SessionID  string
 	AppName    string
