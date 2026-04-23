@@ -3,6 +3,7 @@ package sessions
 import (
 	"time"
 
+	"google.golang.org/adk/tool/toolconfirmation"
 	"google.golang.org/genai"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -270,6 +271,14 @@ func sanitizeValue(v any) any {
 			"response": sanitizeMap(typed.Response),
 		}
 	case genai.FunctionResponse:
+		return sanitizeValue(&typed)
+	case *toolconfirmation.ToolConfirmation:
+		return map[string]any{
+			"hint":      typed.Hint,
+			"confirmed": typed.Confirmed,
+			"payload":   sanitizeValue(typed.Payload),
+		}
+	case toolconfirmation.ToolConfirmation:
 		return sanitizeValue(&typed)
 	default:
 		return v
