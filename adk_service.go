@@ -284,13 +284,13 @@ func eventToProto(sess adksession.Session, event *adksession.Event) (*pb.Session
 	if len(event.Actions.StateDelta) > 0 {
 		_, _, sessionDelta := splitScopedState(event.Actions.StateDelta)
 		if len(sessionDelta) > 0 {
-			stateDelta, err = structpb.NewStruct(sessionDelta)
+			stateDelta, err = structpb.NewStruct(sanitizeMap(sessionDelta))
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
-	customMetadata, err := structpb.NewStruct(event.CustomMetadata)
+	customMetadata, err := structpb.NewStruct(sanitizeMap(event.CustomMetadata))
 	if err != nil && len(event.CustomMetadata) > 0 {
 		return nil, err
 	}

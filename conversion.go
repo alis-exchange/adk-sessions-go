@@ -25,13 +25,13 @@ func partToProto(in *genai.Part) (*pb.Part, error) {
 	case in.FileData != nil:
 		out.Data = &pb.Part_FileData{FileData: &pb.FileData{MimeType: in.FileData.MIMEType, FileUri: in.FileData.FileURI}}
 	case in.FunctionCall != nil:
-		args, err := structpb.NewStruct(in.FunctionCall.Args)
+		args, err := structpb.NewStruct(sanitizeMap(in.FunctionCall.Args))
 		if err != nil {
 			return nil, err
 		}
 		out.Data = &pb.Part_FunctionCall{FunctionCall: &pb.FunctionCall{Name: in.FunctionCall.Name, Args: args, Id: in.FunctionCall.ID}}
 	case in.FunctionResponse != nil:
-		resp, err := structpb.NewStruct(in.FunctionResponse.Response)
+		resp, err := structpb.NewStruct(sanitizeMap(in.FunctionResponse.Response))
 		if err != nil {
 			return nil, err
 		}
@@ -218,6 +218,62 @@ func outcomeFromProto(in pb.CodeExecutionResult_Outcome) genai.Outcome {
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+// sanitizeMap rewrites nested values into forms accepted by structpb.NewStruct.
+//
+// ADK tool-confirmation events can embed typed GenAI values such as
+// *genai.FunctionCall inside otherwise JSON-like argument maps
+// (for example "originalFunctionCall" inside a confirmation request).
+// structpb.NewStruct rejects those typed SDK structs, so persistence must
+// flatten them into plain map[string]any values before proto conversion.
+func sanitizeMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = sanitizeValue(value)
+	}
+	return out
+}
+
+// sanitizeValue recursively normalizes values for protobuf Struct storage.
+//
+// Most values already arrive as JSON-compatible Go types and are returned as-is.
+// The special cases here exist for ADK-generated nested GenAI structs, which are
+// valid runtime values but not directly serializable through structpb.NewStruct.
+func sanitizeValue(v any) any {
+	switch typed := v.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		return sanitizeMap(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = sanitizeValue(item)
+		}
+		return out
+	case *genai.FunctionCall:
+		return map[string]any{
+			"id":   typed.ID,
+			"name": typed.Name,
+			"args": sanitizeMap(typed.Args),
+		}
+	case genai.FunctionCall:
+		return sanitizeValue(&typed)
+	case *genai.FunctionResponse:
+		return map[string]any{
+			"id":       typed.ID,
+			"name":     typed.Name,
+			"response": sanitizeMap(typed.Response),
+		}
+	case genai.FunctionResponse:
+		return sanitizeValue(&typed)
+	default:
+		return v
+	}
 }
 
 func stringPtr(v string) *string {
