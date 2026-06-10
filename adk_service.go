@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	pb "go.alis.build/common/alis/adk/sessions/v1"
 	adkmodel "google.golang.org/adk/model"
 	adksession "google.golang.org/adk/session"
 	"google.golang.org/api/iterator"
@@ -16,8 +17,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-
-	pb "go.alis.build/common/alis/adk/sessions/v1"
 )
 
 type ADKService struct {

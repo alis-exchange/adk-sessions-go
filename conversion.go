@@ -24,7 +24,7 @@ func partToProto(in *genai.Part) (*pb.Part, error) {
 	case in.InlineData != nil:
 		out.Data = &pb.Part_InlineData{InlineData: &pb.Blob{MimeType: in.InlineData.MIMEType, Data: in.InlineData.Data}}
 	case in.FileData != nil:
-		out.Data = &pb.Part_FileData{FileData: &pb.FileData{MimeType: in.FileData.MIMEType, FileUri: in.FileData.FileURI}}
+		out.Data = &pb.Part_FileData{FileData: &pb.FileData{MimeType: in.FileData.MIMEType, FileUri: in.FileData.FileURI, DisplayName: in.FileData.DisplayName}}
 	case in.FunctionCall != nil:
 		args, err := structpb.NewStruct(sanitizeMap(in.FunctionCall.Args))
 		if err != nil {
@@ -76,7 +76,7 @@ func partFromProto(in *pb.Part) *genai.Part {
 	case *pb.Part_InlineData:
 		out.InlineData = &genai.Blob{MIMEType: data.InlineData.GetMimeType(), Data: data.InlineData.GetData()}
 	case *pb.Part_FileData:
-		out.FileData = &genai.FileData{MIMEType: data.FileData.GetMimeType(), FileURI: data.FileData.GetFileUri()}
+		out.FileData = &genai.FileData{MIMEType: data.FileData.GetMimeType(), FileURI: data.FileData.GetFileUri(), DisplayName: data.FileData.GetDisplayName()}
 	case *pb.Part_FunctionCall:
 		out.FunctionCall = &genai.FunctionCall{Name: data.FunctionCall.GetName(), Args: structMap(data.FunctionCall.GetArgs()), ID: data.FunctionCall.GetId()}
 	case *pb.Part_FunctionResponse:
