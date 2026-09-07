@@ -3,6 +3,8 @@ package sessions
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "go.alis.build/common/alis/adk/sessions/v1"
+	pb "go.alis.build/common/alis/adk/sessions"
 )
 
 const (
@@ -44,12 +46,15 @@ type SpannerConfig struct {
 	TablePrefix string
 }
 
+// SpannerService stores sessions, events, and scoped state in Spanner and
+// serves the generated alis.adk.sessions.v1 gRPC API.
 type SpannerService struct {
 	db     *spanner.Client
 	config SpannerConfig
 	pb.UnimplementedSessionServiceServer
 }
 
+// NewSpannerService connects to the configured database.
 func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerService, error) {
 	dbName := fmt.Sprintf("projects/%s/instances/%s/databases/%s", config.Project, config.Instance, config.Database)
 	db, err := spanner.NewClientWithConfig(ctx, dbName, spanner.ClientConfig{
@@ -78,9 +83,24 @@ func (s *SpannerService) userStatesTable() string {
 	return prefixedTableName(s.config.TablePrefix, userStatesTableName)
 }
 
+// Register registers the generated SessionService server on a gRPC server.
 func (s *SpannerService) Register(registrar grpc.ServiceRegistrar) {
 	pb.RegisterSessionServiceServer(registrar, s)
 }
+
+// txReader is the read surface shared by single-use, read-only, and
+// read-write Spanner transactions, so one set of helpers serves every path.
+type txReader interface {
+	ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
+	Query(ctx context.Context, statement spanner.Statement) *spanner.RowIterator
+}
+
+var (
+	sessionColumns = []string{"session_id", "app_name", "user_id", "Session"}
+	eventColumns   = []string{"session_id", "app_name", "user_id", "event_id", "SessionEvent"}
+)
+
+// gRPC surface.
 
 func (s *SpannerService) CreateSession(ctx context.Context, req *pb.CreateSessionRequest) (*pb.Session, error) {
 	session, _, _, err := s.createSession(ctx, req.GetSession(), req.GetSessionId())
@@ -92,7 +112,7 @@ func (s *SpannerService) GetSession(ctx context.Context, req *pb.GetSessionReque
 	if err != nil {
 		return nil, err
 	}
-	record, err := s.readSessionByID(ctx, sessionID)
+	record, err := s.readSessionByID(ctx, s.db.Single(), sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -118,8 +138,7 @@ func (s *SpannerService) ListSessions(ctx context.Context, req *pb.ListSessionsR
 		query += " WHERE " + where
 	}
 	query += " ORDER BY " + applySessionOrderBy(req.GetOrderBy()) + " LIMIT @limit OFFSET @offset"
-	stmt := spanner.Statement{SQL: query, Params: params}
-	iter := s.db.Single().Query(ctx, stmt)
+	iter := s.db.Single().Query(ctx, spanner.Statement{SQL: query, Params: params})
 	defer iter.Stop()
 
 	var sessions []*pb.Session
@@ -149,30 +168,28 @@ func (s *SpannerService) UpdateSession(ctx context.Context, req *pb.UpdateSessio
 	if req.GetSession() == nil || req.GetSession().GetId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "session.id is required")
 	}
-	record, err := s.readSessionByCompositeKey(ctx, req.GetSession().GetId(), req.GetSession().GetAppName(), req.GetSession().GetUserId())
+	record, err := s.readSessionByCompositeKey(ctx, s.db.Single(), req.GetSession().GetId(), req.GetSession().GetAppName(), req.GetSession().GetUserId())
 	if err != nil {
 		return nil, err
 	}
-	current := cloneSession(record.Session)
 	mask := req.GetUpdateMask()
 	if mask == nil || len(mask.GetPaths()) == 0 {
 		mask = &fieldmaskpb.FieldMask{Paths: []string{"display_name", "state", "expire_time", "ttl"}}
 	}
-	next := cloneSession(current)
+	next := cloneSession(record.Session)
+	var appDelta, userDelta map[string]any
 	for _, path := range mask.Paths {
 		switch path {
 		case "display_name":
 			next.DisplayName = req.GetSession().DisplayName
 		case "state":
-			appState, userState, sessionState := splitScopedState(structMap(req.GetSession().GetState()))
-			stateStruct, err := structpb.NewStruct(sessionState)
+			var sessionState map[string]any
+			appDelta, userDelta, sessionState = splitScopedState(structMap(req.GetSession().GetState()))
+			stateStruct, err := structOrNil(sessionState)
 			if err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid state: %v", err)
 			}
 			next.State = stateStruct
-			if err := s.writeScopedStates(ctx, next.GetAppName(), next.GetUserId(), appState, userState); err != nil {
-				return nil, err
-			}
 		case "expire_time":
 			if ts := req.GetSession().GetExpireTime(); ts != nil {
 				next.Expiration = &pb.Session_ExpireTime{ExpireTime: ts}
@@ -190,11 +207,14 @@ func (s *SpannerService) UpdateSession(ctx context.Context, req *pb.UpdateSessio
 		}
 	}
 	next.UpdateTime = timestamppb.Now()
-	mutation, err := s.sessionMutation(next)
-	if err != nil {
-		return nil, err
-	}
-	_, err = s.db.Apply(ctx, []*spanner.Mutation{mutation})
+	_, err = s.db.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		muts, _, _, err := s.scopedStateMutations(ctx, txn, next.GetAppName(), next.GetUserId(), appDelta, userDelta)
+		if err != nil {
+			return err
+		}
+		muts = append(muts, s.sessionMutation(next))
+		return txn.BufferWrite(muts)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -206,22 +226,11 @@ func (s *SpannerService) DeleteSession(ctx context.Context, req *pb.DeleteSessio
 	if err != nil {
 		return nil, err
 	}
-	record, err := s.readSessionByID(ctx, sessionID)
+	record, err := s.readSessionByID(ctx, s.db.Single(), sessionID)
 	if err != nil {
 		return nil, err
 	}
-	muts := []*spanner.Mutation{
-		spanner.Delete(s.sessionsTable(), spanner.Key{record.SessionID, record.AppName, record.UserID}),
-	}
-	eventKeys, err := s.listEventKeys(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	for _, key := range eventKeys {
-		muts = append(muts, spanner.Delete(s.eventsTable(), key))
-	}
-	_, err = s.db.Apply(ctx, muts)
-	if err != nil {
+	if err := s.deleteSession(ctx, record.SessionID, record.AppName, record.UserID); err != nil {
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
@@ -262,7 +271,7 @@ func (s *SpannerService) ListEvents(ctx context.Context, req *pb.ListEventsReque
 	if filter != "" {
 		where += " AND " + filter
 	}
-	stmt := spanner.Statement{
+	events, err := s.queryEvents(ctx, s.db.Single(), spanner.Statement{
 		SQL: fmt.Sprintf(
 			"SELECT SessionEvent FROM %s WHERE %s ORDER BY %s LIMIT @limit OFFSET @offset",
 			s.eventsTable(),
@@ -270,24 +279,9 @@ func (s *SpannerService) ListEvents(ctx context.Context, req *pb.ListEventsReque
 			applyEventOrderBy(req.GetOrderBy()),
 		),
 		Params: params,
-	}
-	iter := s.db.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	var events []*pb.SessionEvent
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		var event pb.SessionEvent
-		if err := row.Columns(&event); err != nil {
-			return nil, err
-		}
-		events = append(events, cloneEvent(&event))
+	})
+	if err != nil {
+		return nil, err
 	}
 	nextToken := ""
 	if len(events) > pageSize {
@@ -305,14 +299,24 @@ func (s *SpannerService) AppendEvent(ctx context.Context, req *pb.AppendEventReq
 	if req.GetEvent() == nil {
 		return nil, status.Error(codes.InvalidArgument, "event is required")
 	}
-	if _, err := s.appendEvent(ctx, sessionID, req.GetEvent()); err != nil {
+	record, err := s.readSessionByID(ctx, s.db.Single(), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.appendEvent(ctx, record.SessionID, record.AppName, record.UserID, req.GetEvent()); err != nil {
 		return nil, err
 	}
 	return &pb.AppendEventResponse{}, nil
 }
 
+// Store operations shared by the gRPC and ADK surfaces.
+
+// createSession inserts a session and folds any app:/user: keys of its
+// initial state into the shared AppStates and UserStates rows. It returns
+// the stored session together with the full app and user state after the
+// write, read inside the same transaction.
 func (s *SpannerService) createSession(ctx context.Context, input *pb.Session, suppliedID string) (*pb.Session, map[string]any, map[string]any, error) {
-	session, appState, userState, err := normalizeSession(input)
+	session, appDelta, userDelta, err := normalizeSession(input)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -320,167 +324,140 @@ func (s *SpannerService) createSession(ctx context.Context, input *pb.Session, s
 	now := timestamppb.Now()
 	session.CreateTime = now
 	session.UpdateTime = now
-	mutation, err := s.sessionMutation(session)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	muts := []*spanner.Mutation{mutation}
-	appMut, err := s.appStateMutation(ctx, session.GetAppName(), appState)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if appMut != nil {
-		muts = append(muts, appMut)
-	}
-	userMut, err := s.userStateMutation(ctx, session.GetAppName(), session.GetUserId(), userState)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if userMut != nil {
-		muts = append(muts, userMut)
-	}
-	_, err = s.db.Apply(ctx, muts)
+
+	var appState, userState map[string]any
+	_, err = s.db.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		muts, app, user, err := s.scopedStateMutations(ctx, txn, session.GetAppName(), session.GetUserId(), appDelta, userDelta)
+		if err != nil {
+			return err
+		}
+		appState, userState = app, user
+		muts = append(muts, spanner.Insert(s.sessionsTable(), sessionColumns,
+			[]any{session.GetId(), session.GetAppName(), session.GetUserId(), session}))
+		return txn.BufferWrite(muts)
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	return session, appState, userState, nil
 }
 
-func (s *SpannerService) appendEvent(ctx context.Context, sessionID string, input *pb.SessionEvent) (*pb.SessionEvent, error) {
-	record, err := s.readSessionByID(ctx, sessionID)
-	if err != nil {
-		return nil, err
+// appendEvent stores an event under the session identified by the composite
+// key and applies its state delta: session keys onto the Session row, app:
+// and user: keys onto their shared rows. The stored event keeps the delta
+// as written apart from "temp:" keys, which are never persisted.
+func (s *SpannerService) appendEvent(ctx context.Context, sessionID, appName, userID string, input *pb.SessionEvent) (*pb.SessionEvent, error) {
+	if input == nil {
+		return nil, status.Error(codes.InvalidArgument, "event is required")
 	}
-	session := cloneSession(record.Session)
 	event := cloneEvent(input)
 	event.Id = nextEventID(event.GetId())
-	event.SessionId = session.GetId()
-	event.AppName = session.GetAppName()
-	event.UserId = session.GetUserId()
+	event.SessionId = sessionID
+	event.AppName = appName
+	event.UserId = userID
 	if event.GetTimestamp() == nil {
 		event.Timestamp = timestamppb.Now()
 	}
-	appDelta, userDelta, sessionDelta := splitScopedState(structMap(event.GetActions().GetStateDelta()))
-	if len(sessionDelta) == 0 {
-		if event.Actions != nil {
-			event.Actions.StateDelta = nil
-		}
-	} else {
-		stateDelta, err := structpb.NewStruct(sessionDelta)
+	delta := trimTempKeys(structMap(event.GetActions().GetStateDelta()))
+	appDelta, userDelta, sessionDelta := splitScopedState(delta)
+	if event.Actions != nil {
+		stateDelta, err := structOrNil(delta)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid state delta: %v", err)
 		}
-		if event.Actions == nil {
-			event.Actions = &pb.EventActions{}
-		}
 		event.Actions.StateDelta = stateDelta
 	}
-	eventMutation := spanner.Insert(s.eventsTable(),
-		[]string{"session_id", "app_name", "user_id", "event_id", "SessionEvent"},
-		[]any{event.GetSessionId(), event.GetAppName(), event.GetUserId(), event.GetId(), event},
-	)
-	sessionState, err := mergeDelta(structMap(session.GetState()), sessionDelta)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid session state delta: %v", err)
-	}
-	session.State = sessionState
-	session.UpdateTime = event.Timestamp
-	sessionMutation, err := s.sessionMutation(session)
-	if err != nil {
-		return nil, err
-	}
-	muts := []*spanner.Mutation{sessionMutation, eventMutation}
-	appMut, err := s.appStateMutation(ctx, session.GetAppName(), appDelta)
-	if err != nil {
-		return nil, err
-	}
-	if appMut != nil {
-		muts = append(muts, appMut)
-	}
-	userMut, err := s.userStateMutation(ctx, session.GetAppName(), session.GetUserId(), userDelta)
-	if err != nil {
-		return nil, err
-	}
-	if userMut != nil {
-		muts = append(muts, userMut)
-	}
-	_, err = s.db.Apply(ctx, muts)
+
+	_, err := s.db.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		record, err := s.readSessionByCompositeKey(ctx, txn, sessionID, appName, userID)
+		if err != nil {
+			return err
+		}
+		session := cloneSession(record.Session)
+		state, err := mergeDelta(structMap(session.GetState()), sessionDelta)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "invalid session state delta: %v", err)
+		}
+		session.State = state
+		session.UpdateTime = event.Timestamp
+
+		muts, _, _, err := s.scopedStateMutations(ctx, txn, appName, userID, appDelta, userDelta)
+		if err != nil {
+			return err
+		}
+		muts = append(muts,
+			s.sessionMutation(session),
+			spanner.Insert(s.eventsTable(), eventColumns,
+				[]any{event.GetSessionId(), event.GetAppName(), event.GetUserId(), event.GetId(), event}),
+		)
+		return txn.BufferWrite(muts)
+	})
 	if err != nil {
 		return nil, err
 	}
 	return event, nil
 }
 
-func (s *SpannerService) sessionMutation(session *pb.Session) (*spanner.Mutation, error) {
-	return spanner.InsertOrUpdate(s.sessionsTable(),
-		[]string{"session_id", "app_name", "user_id", "Session"},
-		[]any{session.GetId(), session.GetAppName(), session.GetUserId(), session},
-	), nil
-}
-
-func (s *SpannerService) writeScopedStates(ctx context.Context, appName, userID string, appState, userState map[string]any) error {
-	var muts []*spanner.Mutation
-	appMut, err := s.appStateMutation(ctx, appName, appState)
-	if err != nil {
-		return err
-	}
-	if appMut != nil {
-		muts = append(muts, appMut)
-	}
-	userMut, err := s.userStateMutation(ctx, appName, userID, userState)
-	if err != nil {
-		return err
-	}
-	if userMut != nil {
-		muts = append(muts, userMut)
-	}
-	if len(muts) == 0 {
-		return nil
-	}
-	_, err = s.db.Apply(ctx, muts)
+// deleteSession removes a session row and every event under it. Spanner
+// delete mutations on missing rows are no-ops, so this is idempotent.
+func (s *SpannerService) deleteSession(ctx context.Context, sessionID, appName, userID string) error {
+	key := spanner.Key{sessionID, appName, userID}
+	_, err := s.db.Apply(ctx, []*spanner.Mutation{
+		spanner.Delete(s.sessionsTable(), key),
+		spanner.Delete(s.eventsTable(), key.AsPrefix()),
+	})
 	return err
 }
 
-func (s *SpannerService) appStateMutation(ctx context.Context, appName string, delta map[string]any) (*spanner.Mutation, error) {
-	if len(delta) == 0 {
-		return nil, nil
-	}
-	existing, err := s.readAppState(ctx, appName)
-	if err != nil && status.Code(err) != codes.NotFound {
-		return nil, err
-	}
-	state, err := mergeDelta(existing, delta)
-	if err != nil {
-		return nil, err
-	}
-	resource := &pb.AppState{AppName: appName, State: state, UpdateTime: timestamppb.Now()}
-	return spanner.InsertOrUpdate(s.appStatesTable(),
-		[]string{"app_name", "AppState"},
-		[]any{appName, resource},
-	), nil
+func (s *SpannerService) sessionMutation(session *pb.Session) *spanner.Mutation {
+	return spanner.InsertOrUpdate(s.sessionsTable(), sessionColumns,
+		[]any{session.GetId(), session.GetAppName(), session.GetUserId(), session})
 }
 
-func (s *SpannerService) userStateMutation(ctx context.Context, appName, userID string, delta map[string]any) (*spanner.Mutation, error) {
-	if len(delta) == 0 {
-		return nil, nil
-	}
-	existing, err := s.readUserState(ctx, appName, userID)
-	if err != nil && status.Code(err) != codes.NotFound {
-		return nil, err
-	}
-	state, err := mergeDelta(existing, delta)
+// scopedStateMutations reads the current app and user state through r,
+// merges the deltas, and returns the mutations to write plus the resulting
+// state maps. Callers run it inside the transaction that commits the
+// mutations so concurrent deltas cannot overwrite each other.
+func (s *SpannerService) scopedStateMutations(ctx context.Context, r txReader, appName, userID string, appDelta, userDelta map[string]any) ([]*spanner.Mutation, map[string]any, map[string]any, error) {
+	appState, err := s.readAppState(ctx, r, appName)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	resource := &pb.UserState{AppName: appName, UserId: userID, State: state, UpdateTime: timestamppb.Now()}
-	return spanner.InsertOrUpdate(s.userStatesTable(),
-		[]string{"app_name", "user_id", "UserState"},
-		[]any{appName, userID, resource},
-	), nil
+	userState, err := s.readUserState(ctx, r, appName, userID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var muts []*spanner.Mutation
+	if len(appDelta) > 0 {
+		appState = mergedState(appState, appDelta)
+		state, err := structpb.NewStruct(appState)
+		if err != nil {
+			return nil, nil, nil, status.Errorf(codes.InvalidArgument, "invalid app state: %v", err)
+		}
+		resource := &pb.AppState{AppName: appName, State: state, UpdateTime: timestamppb.Now()}
+		muts = append(muts, spanner.InsertOrUpdate(s.appStatesTable(), []string{"app_name", "AppState"}, []any{appName, resource}))
+	}
+	if len(userDelta) > 0 {
+		userState = mergedState(userState, userDelta)
+		state, err := structpb.NewStruct(userState)
+		if err != nil {
+			return nil, nil, nil, status.Errorf(codes.InvalidArgument, "invalid user state: %v", err)
+		}
+		resource := &pb.UserState{AppName: appName, UserId: userID, State: state, UpdateTime: timestamppb.Now()}
+		muts = append(muts, spanner.InsertOrUpdate(s.userStatesTable(), []string{"app_name", "user_id", "UserState"}, []any{appName, userID, resource}))
+	}
+	return muts, appState, userState, nil
 }
 
-func (s *SpannerService) readSessionByCompositeKey(ctx context.Context, sessionID, appName, userID string) (*sessionRecord, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.sessionsTable(), spanner.Key{sessionID, appName, userID},
+func mergedState(existing, delta map[string]any) map[string]any {
+	out := make(map[string]any, len(existing)+len(delta))
+	maps.Copy(out, existing)
+	maps.Copy(out, delta)
+	return out
+}
+
+func (s *SpannerService) readSessionByCompositeKey(ctx context.Context, r txReader, sessionID, appName, userID string) (*sessionRecord, error) {
+	row, err := r.ReadRow(ctx, s.sessionsTable(), spanner.Key{sessionID, appName, userID},
 		[]string{"session_id", "app_name", "user_id", "create_time", "update_time", "Session"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
@@ -488,22 +465,18 @@ func (s *SpannerService) readSessionByCompositeKey(ctx context.Context, sessionI
 		}
 		return nil, err
 	}
-	var record sessionRecord
-	record.Session = &pb.Session{}
-	if err := row.Columns(&record.SessionID, &record.AppName, &record.UserID, &record.CreateTime, &record.UpdateTime, record.Session); err != nil {
-		return nil, err
-	}
-	return &record, nil
+	return scanSessionRecord(row)
 }
 
-func (s *SpannerService) readSessionByID(ctx context.Context, sessionID string) (*sessionRecord, error) {
-	stmt := spanner.Statement{
+// readSessionByID resolves a session by ID alone, for the gRPC resource
+// names that carry no app or user. It requires the ID to be globally unique.
+func (s *SpannerService) readSessionByID(ctx context.Context, r txReader, sessionID string) (*sessionRecord, error) {
+	iter := r.Query(ctx, spanner.Statement{
 		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, create_time, update_time, Session FROM %s WHERE session_id=@session_id LIMIT 2", s.sessionsTable()),
 		Params: map[string]any{"session_id": sessionID},
-	}
-	iter := s.db.Single().Query(ctx, stmt)
+	})
 	defer iter.Stop()
-	var records []sessionRecord
+	var records []*sessionRecord
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
@@ -512,9 +485,8 @@ func (s *SpannerService) readSessionByID(ctx context.Context, sessionID string) 
 		if err != nil {
 			return nil, err
 		}
-		var record sessionRecord
-		record.Session = &pb.Session{}
-		if err := row.Columns(&record.SessionID, &record.AppName, &record.UserID, &record.CreateTime, &record.UpdateTime, record.Session); err != nil {
+		record, err := scanSessionRecord(row)
+		if err != nil {
 			return nil, err
 		}
 		records = append(records, record)
@@ -525,15 +497,22 @@ func (s *SpannerService) readSessionByID(ctx context.Context, sessionID string) 
 	if len(records) > 1 {
 		return nil, status.Error(codes.FailedPrecondition, "session id is not globally unique")
 	}
-	return &records[0], nil
+	return records[0], nil
+}
+
+func scanSessionRecord(row *spanner.Row) (*sessionRecord, error) {
+	record := &sessionRecord{Session: &pb.Session{}}
+	if err := row.Columns(&record.SessionID, &record.AppName, &record.UserID, &record.CreateTime, &record.UpdateTime, record.Session); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func (s *SpannerService) readEventByID(ctx context.Context, sessionID, eventID string) (*eventRecord, error) {
-	stmt := spanner.Statement{
+	iter := s.db.Single().Query(ctx, spanner.Statement{
 		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id, timestamp, SessionEvent FROM %s WHERE session_id=@session_id AND event_id=@event_id LIMIT 2", s.eventsTable()),
 		Params: map[string]any{"session_id": sessionID, "event_id": eventID},
-	}
-	iter := s.db.Single().Query(ctx, stmt)
+	})
 	defer iter.Stop()
 	var records []eventRecord
 	for {
@@ -560,14 +539,42 @@ func (s *SpannerService) readEventByID(ctx context.Context, sessionID, eventID s
 	return &records[0], nil
 }
 
-func (s *SpannerService) listEventKeys(ctx context.Context, sessionID string) ([]spanner.Key, error) {
-	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT session_id, app_name, user_id, event_id FROM %s WHERE session_id=@session_id", s.eventsTable()),
-		Params: map[string]any{"session_id": sessionID},
+// listSessionEvents returns a session's events in timestamp order. With
+// numRecent > 0 only the most recent numRecent events are returned, still
+// oldest first. after, when set, excludes events before that instant; it is
+// compared at microsecond precision because that is the resolution of the
+// generated timestamp column.
+func (s *SpannerService) listSessionEvents(ctx context.Context, r txReader, sessionID, appName, userID string, after time.Time, numRecent int) ([]*pb.SessionEvent, error) {
+	params := map[string]any{"session_id": sessionID, "app_name": appName, "user_id": userID}
+	where := "session_id=@session_id AND app_name=@app_name AND user_id=@user_id"
+	if !after.IsZero() {
+		where += " AND timestamp>=@after"
+		params["after"] = after.Truncate(time.Microsecond)
 	}
-	iter := s.db.Single().Query(ctx, stmt)
+	order := "timestamp ASC, event_id ASC"
+	limit := ""
+	if numRecent > 0 {
+		order = "timestamp DESC, event_id DESC"
+		limit = " LIMIT @limit"
+		params["limit"] = int64(numRecent)
+	}
+	events, err := s.queryEvents(ctx, r, spanner.Statement{
+		SQL:    fmt.Sprintf("SELECT SessionEvent FROM %s WHERE %s ORDER BY %s%s", s.eventsTable(), where, order, limit),
+		Params: params,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if numRecent > 0 {
+		slices.Reverse(events)
+	}
+	return events, nil
+}
+
+func (s *SpannerService) queryEvents(ctx context.Context, r txReader, stmt spanner.Statement) ([]*pb.SessionEvent, error) {
+	iter := r.Query(ctx, stmt)
 	defer iter.Stop()
-	var out []spanner.Key
+	var events []*pb.SessionEvent
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
@@ -576,20 +583,21 @@ func (s *SpannerService) listEventKeys(ctx context.Context, sessionID string) ([
 		if err != nil {
 			return nil, err
 		}
-		var sid, app, user, eventID string
-		if err := row.Columns(&sid, &app, &user, &eventID); err != nil {
+		var event pb.SessionEvent
+		if err := row.Columns(&event); err != nil {
 			return nil, err
 		}
-		out = append(out, spanner.Key{sid, app, user, eventID})
+		events = append(events, cloneEvent(&event))
 	}
-	return out, nil
+	return events, nil
 }
 
-func (s *SpannerService) readAppState(ctx context.Context, appName string) (map[string]any, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.appStatesTable(), spanner.Key{appName}, []string{"AppState"})
+// readAppState returns the shared state of an app, or nil when none is stored.
+func (s *SpannerService) readAppState(ctx context.Context, r txReader, appName string) (map[string]any, error) {
+	row, err := r.ReadRow(ctx, s.appStatesTable(), spanner.Key{appName}, []string{"AppState"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, err
+			return nil, nil
 		}
 		return nil, err
 	}
@@ -600,11 +608,12 @@ func (s *SpannerService) readAppState(ctx context.Context, appName string) (map[
 	return structMap(resource.GetState()), nil
 }
 
-func (s *SpannerService) readUserState(ctx context.Context, appName, userID string) (map[string]any, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.userStatesTable(), spanner.Key{appName, userID}, []string{"UserState"})
+// readUserState returns a user's state within an app, or nil when none is stored.
+func (s *SpannerService) readUserState(ctx context.Context, r txReader, appName, userID string) (map[string]any, error) {
+	row, err := r.ReadRow(ctx, s.userStatesTable(), spanner.Key{appName, userID}, []string{"UserState"})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, err
+			return nil, nil
 		}
 		return nil, err
 	}
