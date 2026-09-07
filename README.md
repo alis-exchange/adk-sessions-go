@@ -4,19 +4,19 @@
 
 ![ADK Sessions banner](banner.svg)
 
-This project contains a Go package for persisting ADK sessions in Google Cloud Spanner.
+This project contains a Go package for persisting [ADK Go](https://github.com/google/adk-go) sessions in Google Cloud Spanner.
 
 The package exposes one storage implementation and one adapter on top of it:
 
-- `SpannerService` provides CRUD and event append operations over `go.alis.build/common/alis/adk/sessions/v1`.
-- `ADKService` implements `google.golang.org/adk/session.Service` on top of the same Spanner-backed store.
+- `SpannerService` provides CRUD and event append operations over the `alis.adk.sessions.v1` protos (`go.alis.build/common/alis/adk/sessions`).
+- `ADKService` implements `google.golang.org/adk/v2/session.Service` on top of the same Spanner-backed store and passes ADK's session conformance suite.
 
 The core idea is simple: keep the session record, the event stream, app-scoped state, and user-scoped state in a single persistence model so your ADK runner and your gRPC API stay aligned.
 
 ## Features
 
 - **Spanner-backed session persistence:** Stores sessions and events in protobuf-backed Spanner tables.
-- **ADK integration:** [`NewADKService`](adk_service.go) adapts the same store to `google.golang.org/adk/session.Service`.
+- **ADK v2 integration:** [`NewADKService`](adk_service.go) adapts the same store to `google.golang.org/adk/v2/session.Service`, including compaction records, tool confirmations, and workflow fields.
 - **Generated gRPC API support:** [`(*SpannerService).Register`](spanner.go) registers the protobuf `SessionService` server on your gRPC server.
 - **Scoped state handling:** App state, user state, and session state are stored separately and recomposed for ADK consumers.
 - **Minimal runtime surface:** The public API is intentionally small: configure the store once, then use it from both the ADK runner and gRPC transport.
@@ -27,8 +27,8 @@ The core idea is simple: keep the session record, the event stream, app-scoped s
 | --- | --- |
 | [`NewSpannerService`](spanner.go) | Creates the backing Spanner store from [`SpannerConfig`](spanner.go). |
 | [`(*SpannerService).Register`](spanner.go) | Registers the generated `SessionService` gRPC server. |
-| [`NewADKService`](adk_service.go) | Wraps the store as `google.golang.org/adk/session.Service`. |
-| [`DatabaseSession`](adk_service.go) | ADK-facing session implementation that exposes merged state and ordered events. |
+| [`NewADKService`](adk_service.go) | Wraps the store as `google.golang.org/adk/v2/session.Service`. |
+| [`DatabaseSession`](adk_service.go) | ADK-facing session implementation that exposes merged state and ordered events, kept live as events are appended. |
 
 The expected schema is documented in [`doc.go`](doc.go).
 
@@ -41,7 +41,7 @@ flowchart LR
     G[gRPC server]
   end
 
-  subgraph pkg [go.alis.build/adk/sessions]
+  subgraph pkg [go.alis.build/adk/sessions/v2]
     S[SpannerService]
     D[ADKService]
   end
@@ -74,8 +74,17 @@ That split is the key design concept of this package. ADK callers see one merged
 ## Installation
 
 ```bash
-go get -u go.alis.build/adk/sessions
+go get go.alis.build/adk/sessions/v2
 ```
+
+### Versions
+
+| Module | Branch | ADK | Protos |
+| --- | --- | --- | --- |
+| `go.alis.build/adk/sessions/v2` | `main` | `google.golang.org/adk/v2` | `go.alis.build/common/alis/adk/sessions` |
+| `go.alis.build/adk/sessions` (v1.x) | `v1` | `google.golang.org/adk` (v1) | `go.alis.build/common/alis/adk/sessions/v1` |
+
+v1 receives fixes on the `v1` branch. New work targets v2.
 
 ## Intentional setup flow
 
@@ -327,6 +336,8 @@ resource "alis_google_spanner_table" "user_states" {
 }
 ```
 
+The proto bundle behind these `PROTO` columns is managed by the `alis_google_spanner_table` resource. When you upgrade `go.alis.build/common/alis/adk/sessions`, re-apply the module so the bundle picks up new fields (v2 stores compaction records and workflow fields that older bundles do not know about).
+
 At the end of this step, you should know these concrete values:
 
 | Value | Why it matters |
@@ -346,7 +357,7 @@ import (
 	"context"
 	"log"
 
-	sessions "go.alis.build/adk/sessions"
+	sessions "go.alis.build/adk/sessions/v2"
 )
 
 func initSessionStore(ctx context.Context) *sessions.SpannerService {
@@ -394,8 +405,8 @@ import (
 	"context"
 	"log"
 
-	sessions "go.alis.build/adk/sessions"
-	adksession "google.golang.org/adk/session"
+	sessions "go.alis.build/adk/sessions/v2"
+	adksession "google.golang.org/adk/v2/session"
 )
 
 func initSessionService(ctx context.Context) adksession.Service {
@@ -418,14 +429,35 @@ func initSessionService(ctx context.Context) adksession.Service {
 One detail matters when you use this package with ADK state:
 
 - Session-scoped keys stay on the `Session` record.
-- App-scoped keys are written to `AppStates`.
-- User-scoped keys are written to `UserStates`.
-- Temporary ADK keys are ignored for persistence.
+- `app:` keys are written to `AppStates`, shared by every user and session of the app.
+- `user:` keys are written to `UserStates`, shared by every session of that user within the app.
+- `temp:` keys are never persisted.
 
-On reads, `DatabaseSession` merges those scopes back into the ADK-facing state view. On event append, state deltas are applied back to the in-memory session view so the runner sees the latest state immediately.
+Each stored event keeps its full state delta (minus `temp:` keys) so it reads back exactly as ADK wrote it; the scoped rows are updated in the same transaction. On reads, `DatabaseSession` merges the three scopes into one ADK-facing state view. On event append, the delta (including `temp:` keys) is applied to the live session so the running invocation sees its own writes.
+
+### Behaviour worth knowing
+
+- `Create` with a session ID that already exists for the same app and user fails with `ALREADY_EXISTS`.
+- `Get` with `NumRecentEvents` returns the most recent events, oldest first.
+- ADK `Delete` is scoped to app, user, and session; deleting a missing session is a no-op.
+- An event appended without an ID or timestamp gets both assigned in place, via ADK's `platform` package so providers on the context apply.
+- Compaction records (`Actions.Compaction`) round-trip at nanosecond precision.
+
+## Testing
+
+`go test ./...` runs the pure Go tests. The ADK session conformance suite runs against the Cloud Spanner emulator when `SPANNER_EMULATOR_HOST` is set:
+
+```bash
+make emulator-start   # docker run gcr.io/cloud-spanner-emulator/emulator
+make test-emulator    # SPANNER_EMULATOR_HOST=localhost:9010 go test -run TestADKServiceConformance
+make emulator-stop
+```
+
+The test creates a throwaway database with the proto bundle and the four tables. One emulator limitation: it cannot evaluate the `Timestamp.nanos` field in generated columns, so the emulator schema derives `create_time`, `update_time`, and `timestamp` at whole-second precision. Production DDL (above) keeps microseconds.
 
 ## Notes
 
 - The package is designed around Spanner `PROTO` columns rather than ad hoc JSON blobs.
 - Optional `Policy` columns are supported by the documented schema and match the internal layout we use.
+- A handful of newer `genai` fields have no proto counterpart and are not persisted; [`doc.go`](doc.go) lists them.
 - The authoritative schema description remains in [`doc.go`](doc.go).
