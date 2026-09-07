@@ -8,7 +8,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/google/jsonschema-go v0.4.3
 	github.com/google/uuid v1.6.0
-	go.alis.build/common/alis/adk/sessions v1.23.0
+	go.alis.build/common/alis/adk/sessions v1.24.0
 	google.golang.org/adk/v2 v2.3.0
 	google.golang.org/api v0.293.0
 	google.golang.org/genai v1.69.0
@@ -63,5 +63,3 @@ require (
 	rsc.io/omap v1.2.0 // indirect
 	rsc.io/ordered v1.1.1 // indirect
 )
-
-replace go.alis.build/common/alis/adk/sessions => /private/tmp/claude-501/-Volumes-ExternalSSD-Projects-github-com-alis-exchange-adk-sessions-go/38137ae1-a2d0-4aa2-91e1-303cb892d67f/scratchpad/gen/sessions
