@@ -10,15 +10,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	adksession "google.golang.org/adk/session"
+	adksession "google.golang.org/adk/v2/session"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "go.alis.build/common/alis/adk/sessions/v1"
+	pb "go.alis.build/common/alis/adk/sessions"
 )
 
 var (
@@ -71,10 +70,6 @@ func parseEventName(name string) (string, string, error) {
 
 func sessionName(id string) string {
 	return "sessions/" + id
-}
-
-func eventName(sessionID, eventID string) string {
-	return sessionName(sessionID) + "/events/" + eventID
 }
 
 func newPageToken(offset int) string {
@@ -276,11 +271,4 @@ func buildEventFilter(filter string, params map[string]any) (string, error) {
 	}
 	params["filter_ts"] = ts
 	return fmt.Sprintf("timestamp %s @filter_ts", m[1]), nil
-}
-
-func durationToProto(d time.Duration) *durationpb.Duration {
-	if d == 0 {
-		return nil
-	}
-	return durationpb.New(d)
 }

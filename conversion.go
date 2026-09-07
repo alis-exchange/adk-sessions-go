@@ -1,52 +1,39 @@
 package sessions
 
 import (
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
 	"time"
 
-	"google.golang.org/adk/tool/toolconfirmation"
+	"google.golang.org/adk/v2/tool/toolconfirmation"
 	"google.golang.org/genai"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "go.alis.build/common/alis/adk/sessions/v1"
+	pb "go.alis.build/common/alis/adk/sessions"
 )
 
-func partToProto(in *genai.Part) (*pb.Part, error) {
+// The converters in this package must be lossless for every field the proto
+// can carry, and they must reproduce the exact Go shape ADK hands us: nil for
+// absent slices, maps, and pointers, never an empty non-nil value. ADK's
+// session conformance suite compares round-tripped events with cmp.Diff,
+// where nil and empty are different values.
+
+func contentToProto(in *genai.Content) (*pb.Content, error) {
 	if in == nil {
-		return &pb.Part{}, nil
+		return nil, nil
 	}
-	out := &pb.Part{
-		Thought:          in.Thought,
-		ThoughtSignature: append([]byte(nil), in.ThoughtSignature...),
-	}
-	switch {
-	case in.Text != "":
-		out.Data = &pb.Part_Text{Text: in.Text}
-	case in.InlineData != nil:
-		out.Data = &pb.Part_InlineData{InlineData: &pb.Blob{MimeType: in.InlineData.MIMEType, Data: in.InlineData.Data}}
-	case in.FileData != nil:
-		out.Data = &pb.Part_FileData{FileData: &pb.FileData{MimeType: in.FileData.MIMEType, FileUri: in.FileData.FileURI, DisplayName: in.FileData.DisplayName}}
-	case in.FunctionCall != nil:
-		args, err := structpb.NewStruct(sanitizeMap(in.FunctionCall.Args))
+	out := &pb.Content{Role: in.Role}
+	for _, part := range in.Parts {
+		converted, err := partToProto(part)
 		if err != nil {
 			return nil, err
 		}
-		out.Data = &pb.Part_FunctionCall{FunctionCall: &pb.FunctionCall{Name: in.FunctionCall.Name, Args: args, Id: in.FunctionCall.ID}}
-	case in.FunctionResponse != nil:
-		resp, err := structpb.NewStruct(sanitizeMap(in.FunctionResponse.Response))
-		if err != nil {
-			return nil, err
-		}
-		out.Data = &pb.Part_FunctionResponse{FunctionResponse: &pb.FunctionResponse{Name: in.FunctionResponse.Name, Response: resp, Id: in.FunctionResponse.ID}}
-	case in.ExecutableCode != nil:
-		out.Data = &pb.Part_ExecutableCode{ExecutableCode: &pb.ExecutableCode{Code: in.ExecutableCode.Code, Language: languageToProto(in.ExecutableCode.Language)}}
-	case in.CodeExecutionResult != nil:
-		out.Data = &pb.Part_CodeExecutionResult{CodeExecutionResult: &pb.CodeExecutionResult{Outcome: outcomeToProto(in.CodeExecutionResult.Outcome), Output: in.CodeExecutionResult.Output}}
-	}
-	if in.VideoMetadata != nil {
-		out.Metadata = &pb.Part_VideoMetadata{VideoMetadata: &pb.VideoMetadata{
-			StartOffset: durationToProto(in.VideoMetadata.StartOffset),
-			EndOffset:   durationToProto(in.VideoMetadata.EndOffset),
-		}}
+		out.Parts = append(out.Parts, converted)
 	}
 	return out, nil
 }
@@ -62,29 +49,125 @@ func contentFromProto(in *pb.Content) *genai.Content {
 	return out
 }
 
+// partToProto maps a genai part onto the proto oneof. A genai part is
+// expected to carry exactly one data field; if several are set, the first
+// populated one in the order below wins.
+func partToProto(in *genai.Part) (*pb.Part, error) {
+	if in == nil {
+		return &pb.Part{}, nil
+	}
+	out := &pb.Part{
+		Thought:          in.Thought,
+		ThoughtSignature: bytesOrNil(in.ThoughtSignature),
+	}
+	switch {
+	case in.Text != "":
+		out.Data = &pb.Part_Text{Text: in.Text}
+	case in.InlineData != nil:
+		out.Data = &pb.Part_InlineData{InlineData: &pb.Blob{
+			MimeType:    in.InlineData.MIMEType,
+			Data:        bytesOrNil(in.InlineData.Data),
+			DisplayName: stringPtr(in.InlineData.DisplayName),
+		}}
+	case in.FileData != nil:
+		out.Data = &pb.Part_FileData{FileData: &pb.FileData{
+			MimeType:    in.FileData.MIMEType,
+			FileUri:     in.FileData.FileURI,
+			DisplayName: in.FileData.DisplayName,
+		}}
+	case in.FunctionCall != nil:
+		args, err := structOrNil(sanitizeMap(in.FunctionCall.Args))
+		if err != nil {
+			return nil, err
+		}
+		out.Data = &pb.Part_FunctionCall{FunctionCall: &pb.FunctionCall{
+			Name: in.FunctionCall.Name,
+			Args: args,
+			Id:   in.FunctionCall.ID,
+		}}
+	case in.FunctionResponse != nil:
+		resp, err := structOrNil(sanitizeMap(in.FunctionResponse.Response))
+		if err != nil {
+			return nil, err
+		}
+		fr := &pb.FunctionResponse{
+			Name:     in.FunctionResponse.Name,
+			Response: resp,
+			Id:       in.FunctionResponse.ID,
+		}
+		for _, part := range in.FunctionResponse.Parts {
+			fr.Parts = append(fr.Parts, functionResponsePartToProto(part))
+		}
+		out.Data = &pb.Part_FunctionResponse{FunctionResponse: fr}
+	case in.ExecutableCode != nil:
+		out.Data = &pb.Part_ExecutableCode{ExecutableCode: &pb.ExecutableCode{
+			Code:     in.ExecutableCode.Code,
+			Language: languageToProto(in.ExecutableCode.Language),
+		}}
+	case in.CodeExecutionResult != nil:
+		out.Data = &pb.Part_CodeExecutionResult{CodeExecutionResult: &pb.CodeExecutionResult{
+			Outcome: outcomeToProto(in.CodeExecutionResult.Outcome),
+			Output:  in.CodeExecutionResult.Output,
+		}}
+	}
+	if in.VideoMetadata != nil {
+		out.Metadata = &pb.Part_VideoMetadata{VideoMetadata: &pb.VideoMetadata{
+			StartOffset: durationToProto(in.VideoMetadata.StartOffset),
+			EndOffset:   durationToProto(in.VideoMetadata.EndOffset),
+		}}
+	}
+	return out, nil
+}
+
 func partFromProto(in *pb.Part) *genai.Part {
 	if in == nil {
 		return nil
 	}
 	out := &genai.Part{
 		Thought:          in.GetThought(),
-		ThoughtSignature: append([]byte(nil), in.GetThoughtSignature()...),
+		ThoughtSignature: bytesOrNil(in.GetThoughtSignature()),
 	}
 	switch data := in.GetData().(type) {
 	case *pb.Part_Text:
 		out.Text = data.Text
 	case *pb.Part_InlineData:
-		out.InlineData = &genai.Blob{MIMEType: data.InlineData.GetMimeType(), Data: data.InlineData.GetData()}
+		out.InlineData = &genai.Blob{
+			MIMEType:    data.InlineData.GetMimeType(),
+			Data:        bytesOrNil(data.InlineData.GetData()),
+			DisplayName: data.InlineData.GetDisplayName(),
+		}
 	case *pb.Part_FileData:
-		out.FileData = &genai.FileData{MIMEType: data.FileData.GetMimeType(), FileURI: data.FileData.GetFileUri(), DisplayName: data.FileData.GetDisplayName()}
+		out.FileData = &genai.FileData{
+			MIMEType:    data.FileData.GetMimeType(),
+			FileURI:     data.FileData.GetFileUri(),
+			DisplayName: data.FileData.GetDisplayName(),
+		}
 	case *pb.Part_FunctionCall:
-		out.FunctionCall = &genai.FunctionCall{Name: data.FunctionCall.GetName(), Args: structMap(data.FunctionCall.GetArgs()), ID: data.FunctionCall.GetId()}
+		out.FunctionCall = &genai.FunctionCall{
+			Name: data.FunctionCall.GetName(),
+			Args: structMap(data.FunctionCall.GetArgs()),
+			ID:   data.FunctionCall.GetId(),
+		}
 	case *pb.Part_FunctionResponse:
-		out.FunctionResponse = &genai.FunctionResponse{Name: data.FunctionResponse.GetName(), Response: structMap(data.FunctionResponse.GetResponse()), ID: data.FunctionResponse.GetId()}
+		fr := &genai.FunctionResponse{
+			Name:     data.FunctionResponse.GetName(),
+			Response: structMap(data.FunctionResponse.GetResponse()),
+			ID:       data.FunctionResponse.GetId(),
+		}
+		for _, part := range data.FunctionResponse.GetParts() {
+			fr.Parts = append(fr.Parts, functionResponsePartFromProto(part))
+		}
+		out.FunctionResponse = fr
 	case *pb.Part_ExecutableCode:
-		out.ExecutableCode = &genai.ExecutableCode{Code: data.ExecutableCode.GetCode(), Language: languageFromProto(data.ExecutableCode.GetLanguage())}
+		out.ExecutableCode = &genai.ExecutableCode{
+			Code:     data.ExecutableCode.GetCode(),
+			Language: languageFromProto(data.ExecutableCode.GetLanguage()),
+		}
 	case *pb.Part_CodeExecutionResult:
-		out.CodeExecutionResult = &genai.CodeExecutionResult{Outcome: outcomeFromProto(data.CodeExecutionResult.GetOutcome()), Output: data.CodeExecutionResult.GetOutput()}
+		out.CodeExecutionResult = &genai.CodeExecutionResult{
+			Outcome: outcomeFromProto(data.CodeExecutionResult.GetOutcome()),
+			Output:  data.CodeExecutionResult.GetOutput(),
+		}
 	}
 	if md := in.GetVideoMetadata(); md != nil {
 		out.VideoMetadata = &genai.VideoMetadata{
@@ -95,130 +178,114 @@ func partFromProto(in *pb.Part) *genai.Part {
 	return out
 }
 
-func finishReasonToProto(in genai.FinishReason) pb.FinishReason {
-	switch in {
-	case genai.FinishReasonStop:
-		return pb.FinishReason_FINISH_REASON_STOP
-	case genai.FinishReasonMaxTokens:
-		return pb.FinishReason_FINISH_REASON_MAX_TOKENS
-	case genai.FinishReasonSafety:
-		return pb.FinishReason_FINISH_REASON_SAFETY
-	case genai.FinishReasonRecitation:
-		return pb.FinishReason_FINISH_REASON_RECITATION
-	case genai.FinishReasonLanguage:
-		return pb.FinishReason_FINISH_REASON_LANGUAGE
-	case genai.FinishReasonOther:
-		return pb.FinishReason_FINISH_REASON_OTHER
-	case genai.FinishReasonBlocklist:
-		return pb.FinishReason_FINISH_REASON_BLOCKLIST
-	case genai.FinishReasonProhibitedContent:
-		return pb.FinishReason_FINISH_REASON_PROHIBITED_CONTENT
-	case genai.FinishReasonSPII:
-		return pb.FinishReason_FINISH_REASON_SPII
-	case genai.FinishReasonMalformedFunctionCall:
-		return pb.FinishReason_FINISH_REASON_MALFORMED_FUNCTION_CALL
-	case genai.FinishReasonImageSafety:
-		return pb.FinishReason_FINISH_REASON_IMAGE_SAFETY
-	case genai.FinishReasonUnexpectedToolCall:
-		return pb.FinishReason_FINISH_REASON_UNEXPECTED_TOOL_CALL
-	case genai.FinishReasonImageProhibitedContent:
-		return pb.FinishReason_FINISH_REASON_IMAGE_PROHIBITED_CONTENT
-	case genai.FinishReasonNoImage:
-		return pb.FinishReason_FINISH_REASON_NO_IMAGE
-	case genai.FinishReasonImageRecitation:
-		return pb.FinishReason_FINISH_REASON_IMAGE_RECITATION
-	case genai.FinishReasonImageOther:
-		return pb.FinishReason_FINISH_REASON_IMAGE_OTHER
-	default:
-		return pb.FinishReason_FINISH_REASON_UNSPECIFIED
+func functionResponsePartToProto(in *genai.FunctionResponsePart) *pb.FunctionResponsePart {
+	out := &pb.FunctionResponsePart{}
+	if in == nil {
+		return out
 	}
+	switch {
+	case in.InlineData != nil:
+		out.Data = &pb.FunctionResponsePart_InlineData{InlineData: &pb.FunctionResponseBlob{
+			MimeType:    in.InlineData.MIMEType,
+			Data:        bytesOrNil(in.InlineData.Data),
+			DisplayName: in.InlineData.DisplayName,
+		}}
+	case in.FileData != nil:
+		out.Data = &pb.FunctionResponsePart_FileData{FileData: &pb.FunctionResponseFileData{
+			MimeType:    in.FileData.MIMEType,
+			FileUri:     in.FileData.FileURI,
+			DisplayName: in.FileData.DisplayName,
+		}}
+	}
+	return out
+}
+
+func functionResponsePartFromProto(in *pb.FunctionResponsePart) *genai.FunctionResponsePart {
+	out := &genai.FunctionResponsePart{}
+	switch data := in.GetData().(type) {
+	case *pb.FunctionResponsePart_InlineData:
+		out.InlineData = &genai.FunctionResponseBlob{
+			MIMEType:    data.InlineData.GetMimeType(),
+			Data:        bytesOrNil(data.InlineData.GetData()),
+			DisplayName: data.InlineData.GetDisplayName(),
+		}
+	case *pb.FunctionResponsePart_FileData:
+		out.FileData = &genai.FunctionResponseFileData{
+			MIMEType:    data.FileData.GetMimeType(),
+			FileURI:     data.FileData.GetFileUri(),
+			DisplayName: data.FileData.GetDisplayName(),
+		}
+	}
+	return out
+}
+
+// Enum mapping.
+//
+// genai enums are strings ("STOP", "TEXT", "PYTHON"); the proto enums carry
+// the same names, sometimes behind a type prefix ("FINISH_REASON_STOP",
+// "MEDIA_MODALITY_TEXT"). Mapping by name keeps future values working
+// without a switch per enum. Zero maps to "" on the way out because that is
+// what genai leaves in a field that was never set; the "*_UNSPECIFIED"
+// strings are accepted on the way in but never produced.
+
+func enumToProto(values map[string]int32, prefix, name string) int32 {
+	if name == "" {
+		return 0
+	}
+	if v, ok := values[name]; ok {
+		return v
+	}
+	if v, ok := values[prefix+name]; ok {
+		return v
+	}
+	return 0
+}
+
+func enumFromProto(names map[int32]string, prefix string, value int32) string {
+	if value == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(names[value], prefix)
+}
+
+func finishReasonToProto(in genai.FinishReason) pb.FinishReason {
+	return pb.FinishReason(enumToProto(pb.FinishReason_value, "FINISH_REASON_", string(in)))
 }
 
 func finishReasonFromProto(in pb.FinishReason) genai.FinishReason {
-	switch in {
-	case pb.FinishReason_FINISH_REASON_STOP:
-		return genai.FinishReasonStop
-	case pb.FinishReason_FINISH_REASON_MAX_TOKENS:
-		return genai.FinishReasonMaxTokens
-	case pb.FinishReason_FINISH_REASON_SAFETY:
-		return genai.FinishReasonSafety
-	case pb.FinishReason_FINISH_REASON_RECITATION:
-		return genai.FinishReasonRecitation
-	case pb.FinishReason_FINISH_REASON_LANGUAGE:
-		return genai.FinishReasonLanguage
-	case pb.FinishReason_FINISH_REASON_OTHER:
-		return genai.FinishReasonOther
-	case pb.FinishReason_FINISH_REASON_BLOCKLIST:
-		return genai.FinishReasonBlocklist
-	case pb.FinishReason_FINISH_REASON_PROHIBITED_CONTENT:
-		return genai.FinishReasonProhibitedContent
-	case pb.FinishReason_FINISH_REASON_SPII:
-		return genai.FinishReasonSPII
-	case pb.FinishReason_FINISH_REASON_MALFORMED_FUNCTION_CALL:
-		return genai.FinishReasonMalformedFunctionCall
-	case pb.FinishReason_FINISH_REASON_IMAGE_SAFETY:
-		return genai.FinishReasonImageSafety
-	case pb.FinishReason_FINISH_REASON_UNEXPECTED_TOOL_CALL:
-		return genai.FinishReasonUnexpectedToolCall
-	case pb.FinishReason_FINISH_REASON_IMAGE_PROHIBITED_CONTENT:
-		return genai.FinishReasonImageProhibitedContent
-	case pb.FinishReason_FINISH_REASON_NO_IMAGE:
-		return genai.FinishReasonNoImage
-	case pb.FinishReason_FINISH_REASON_IMAGE_RECITATION:
-		return genai.FinishReasonImageRecitation
-	case pb.FinishReason_FINISH_REASON_IMAGE_OTHER:
-		return genai.FinishReasonImageOther
-	default:
-		return genai.FinishReasonUnspecified
-	}
+	return genai.FinishReason(enumFromProto(pb.FinishReason_name, "FINISH_REASON_", int32(in)))
 }
 
 func languageToProto(in genai.Language) pb.ExecutableCode_Language {
-	switch in {
-	case genai.LanguagePython:
-		return pb.ExecutableCode_PYTHON
-	default:
-		return pb.ExecutableCode_LANGUAGE_UNSPECIFIED
-	}
+	return pb.ExecutableCode_Language(enumToProto(pb.ExecutableCode_Language_value, "", string(in)))
 }
 
 func languageFromProto(in pb.ExecutableCode_Language) genai.Language {
-	switch in {
-	case pb.ExecutableCode_PYTHON:
-		return genai.LanguagePython
-	default:
-		return genai.LanguageUnspecified
-	}
+	return genai.Language(enumFromProto(pb.ExecutableCode_Language_name, "", int32(in)))
 }
 
 func outcomeToProto(in genai.Outcome) pb.CodeExecutionResult_Outcome {
-	switch in {
-	case genai.OutcomeOK:
-		return pb.CodeExecutionResult_OUTCOME_OK
-	case genai.OutcomeDeadlineExceeded:
-		return pb.CodeExecutionResult_OUTCOME_DEADLINE_EXCEEDED
-	case genai.OutcomeFailed:
-		return pb.CodeExecutionResult_OUTCOME_FAILED
-	default:
-		return pb.CodeExecutionResult_OUTCOME_UNSPECIFIED
-	}
+	return pb.CodeExecutionResult_Outcome(enumToProto(pb.CodeExecutionResult_Outcome_value, "", string(in)))
 }
 
 func outcomeFromProto(in pb.CodeExecutionResult_Outcome) genai.Outcome {
-	switch in {
-	case pb.CodeExecutionResult_OUTCOME_OK:
-		return genai.OutcomeOK
-	case pb.CodeExecutionResult_OUTCOME_DEADLINE_EXCEEDED:
-		return genai.OutcomeDeadlineExceeded
-	case pb.CodeExecutionResult_OUTCOME_FAILED:
-		return genai.OutcomeFailed
-	default:
-		return genai.OutcomeUnspecified
-	}
+	return genai.Outcome(enumFromProto(pb.CodeExecutionResult_Outcome_name, "", int32(in)))
 }
 
-func boolPtr(v bool) *bool {
-	return &v
+func mediaModalityToProto(in genai.MediaModality) pb.MediaModality {
+	return pb.MediaModality(enumToProto(pb.MediaModality_value, "MEDIA_MODALITY_", string(in)))
+}
+
+func mediaModalityFromProto(in pb.MediaModality) genai.MediaModality {
+	return genai.MediaModality(enumFromProto(pb.MediaModality_name, "MEDIA_MODALITY_", int32(in)))
+}
+
+func trafficTypeToProto(in genai.TrafficType) pb.TrafficType {
+	return pb.TrafficType(enumToProto(pb.TrafficType_value, "TRAFFIC_TYPE_", string(in)))
+}
+
+func trafficTypeFromProto(in pb.TrafficType) genai.TrafficType {
+	return genai.TrafficType(enumFromProto(pb.TrafficType_name, "TRAFFIC_TYPE_", int32(in)))
 }
 
 // sanitizeMap rewrites nested values into forms accepted by structpb.NewStruct.
@@ -285,6 +352,60 @@ func sanitizeValue(v any) any {
 	}
 }
 
+// structOrNil is structpb.NewStruct that keeps "no map" distinguishable from
+// "empty map": an empty Struct reads back as a non-nil empty map, which ADK
+// treats as a different value from nil.
+func structOrNil(m map[string]any) (*structpb.Struct, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	return structpb.NewStruct(m)
+}
+
+// jsonValue stores an arbitrary Go value as a protobuf Value by way of its
+// JSON encoding. Anything json.Marshal accepts works, including typed
+// structs, at the cost of JSON's type flattening: ints come back as float64
+// and structs as maps. That matches ADK's own database backend.
+func jsonValue(v any) (*structpb.Value, error) {
+	if v == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("encode value: %w", err)
+	}
+	out := &structpb.Value{}
+	if err := protojson.Unmarshal(raw, out); err != nil {
+		return nil, fmt.Errorf("decode value: %w", err)
+	}
+	return out, nil
+}
+
+func valueToAny(v *structpb.Value) any {
+	if v == nil {
+		return nil
+	}
+	return v.AsInterface()
+}
+
+func bytesOrNil(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return slices.Clone(b)
+}
+
+func cloneOrNil[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+	return slices.Clone(s)
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 func stringPtr(v string) *string {
 	if v == "" {
 		return nil
@@ -299,4 +420,26 @@ func float64Ptr(v float64) *float64 {
 	return &v
 }
 
-func _unused(_ time.Time) {}
+func durationToProto(d time.Duration) *durationpb.Duration {
+	if d == 0 {
+		return nil
+	}
+	return durationpb.New(d)
+}
+
+// timestampOrNil keeps the zero time.Time distinguishable from an instant:
+// timestamppb.New(time.Time{}) would encode year 1, which reads back as a
+// real timestamp rather than "unset".
+func timestampOrNil(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(t)
+}
+
+func timeFromProto(ts *timestamppb.Timestamp) time.Time {
+	if ts == nil {
+		return time.Time{}
+	}
+	return ts.AsTime()
+}
